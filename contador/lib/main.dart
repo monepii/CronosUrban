@@ -117,7 +117,7 @@ class _PersonCounterMapScreenState extends State<PersonCounterMapScreen> with Si
 
   Future<void> _fetchCount() async {
     try {
-      final response = await http.get(Uri.parse('http://172.20.10.10:5000/person_count'));
+      final response = await http.get(Uri.parse('https://contador-personas.vercel.app/'));
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
         setState(() {
