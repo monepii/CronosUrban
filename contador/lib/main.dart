@@ -8,6 +8,9 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_polyline_points/flutter_polyline_points.dart';
 import 'dart:async';
 import 'screens/predefined_routes.dart';
+import 'widgets/header.dart';
+import 'widgets/route_info.dart';
+import 'widgets/map_controls.dart';
 import 'dart:math';
 
 void main() {
@@ -68,16 +71,21 @@ class _PersonCounterMapScreenState extends State<PersonCounterMapScreen> with Si
   final MapController _mapController = MapController();
   late AnimationController _animationController;
   late Animation<double> _animation;
-  List<LatLng> routePoints = [];
+  List<LatLng> busRoutePoints = []; // Ruta completa del autobús
+  List<LatLng> walkingPoints = []; // Ruta caminando hasta el punto más cercano
+  LatLng? nearestBusPoint; // Punto más cercano de la ruta del autobús
   LatLng destination = LatLng(19.264208184378365, -99.12763714268449);
   PredefinedRoute? selectedRoute;
   bool _showInfo = true;
+  Timer? _locationTimer;
+  Timer? _countTimer;
+  bool _isCalculatingRoute = false;
 
   @override
   void initState() {
     super.initState();
-    _fetchCount();
-    _getLocation();
+    _setupLocationUpdates();
+    _setupCountUpdates();
     _animationController = AnimationController(
       duration: const Duration(milliseconds: 1500),
       vsync: this,
@@ -91,8 +99,29 @@ class _PersonCounterMapScreenState extends State<PersonCounterMapScreen> with Si
     _animationController.forward();
   }
 
+  void _setupLocationUpdates() {
+    _getLocation(); // Obtener ubicación inicial
+    _locationTimer = Timer.periodic(const Duration(seconds: 10), (timer) {
+      _getLocation(); // Actualizar ubicación cada 10 segundos
+    });
+    _locationService.changeSettings(
+      accuracy: LocationAccuracy.high,
+      interval: 10000,
+      distanceFilter: 10,
+    );
+  }
+
+  void _setupCountUpdates() {
+    _fetchCount(); // Obtener conteo inicial
+    _countTimer = Timer.periodic(const Duration(seconds: 5), (timer) {
+      _fetchCount(); // Actualizar conteo cada 5 segundos
+    });
+  }
+
   @override
   void dispose() {
+    _locationTimer?.cancel();
+    _countTimer?.cancel();
     _animationController.dispose();
     super.dispose();
   }
@@ -114,9 +143,6 @@ class _PersonCounterMapScreenState extends State<PersonCounterMapScreen> with Si
     setState(() {
       _currentLocation = loc;
     });
-
-    // Centrar el mapa en la ubicación
-    _mapController.move(LatLng(loc.latitude!, loc.longitude!), 15);
   }
 
   Future<void> _fetchCount() async {
@@ -131,7 +157,6 @@ class _PersonCounterMapScreenState extends State<PersonCounterMapScreen> with Si
     } catch (e) {
       print("Error al obtener el contador: $e");
     }
-    Future.delayed(const Duration(seconds: 1), _fetchCount);
   }
 
   // Función para calcular la distancia entre dos puntos
@@ -148,30 +173,79 @@ class _PersonCounterMapScreenState extends State<PersonCounterMapScreen> with Si
     return radius * c; // Distancia en metros
   }
 
-  // Función para encontrar el punto más cercano de la ruta
-  LatLng findNearestPoint() {
-    if (_currentLocation == null || selectedRoute == null) {
-      return selectedRoute!.start;
+  Future<void> _updateRouteBasedOnLocation() async {
+    if (_currentLocation == null || selectedRoute == null) return;
+
+    _isCalculatingRoute = true;
+    try {
+      // Encontrar el punto más cercano de la ruta
+      LatLng newNearestPoint = selectedRoute!.waypoints[0];
+      double minDistance = double.infinity;
+      int nearestIndex = 0;
+
+      for (int i = 0; i < selectedRoute!.waypoints.length; i++) {
+        final point = selectedRoute!.waypoints[i];
+        final distance = calculateDistance(
+          LatLng(_currentLocation!.latitude!, _currentLocation!.longitude!),
+          point
+        );
+        if (distance < minDistance) {
+          minDistance = distance;
+          newNearestPoint = point;
+          nearestIndex = i;
+        }
+      }
+
+      setState(() {
+        nearestBusPoint = newNearestPoint;
+      });
+      
+      await _getETA();
+    } finally {
+      _isCalculatingRoute = false;
     }
+  }
 
-    final currentPoint = LatLng(_currentLocation!.latitude!, _currentLocation!.longitude!);
-    LatLng nearestPoint = selectedRoute!.start;
-    double minDistance = calculateDistance(currentPoint, selectedRoute!.start);
-
-    // Revisar todas las paradas de la ruta
-    for (var stop in selectedRoute!.stopCoordinates) {
-      final distance = calculateDistance(currentPoint, stop);
+  // Función para calcular el tiempo restante basado en la distancia proporcional
+  int calculateRemainingTime(LatLng startPoint, List<LatLng> routePoints, String totalTime) {
+    // Extraer el rango de tiempo (ej: de "25-60 minutos (según horario)" obtiene "25-60")
+    final timeRange = totalTime.split(' ')[0];
+    final times = timeRange.split('-');
+    final minMinutes = int.parse(times[0]);
+    final maxMinutes = int.parse(times[1]);
+    // Usar el tiempo promedio del rango
+    final averageMinutes = (minMinutes + maxMinutes) ~/ 2;
+    
+    // Encontrar el índice del punto más cercano en la ruta
+    int startIndex = 0;
+    double minDistance = double.infinity;
+    
+    for (int i = 0; i < routePoints.length; i++) {
+      final distance = calculateDistance(startPoint, routePoints[i]);
       if (distance < minDistance) {
         minDistance = distance;
-        nearestPoint = stop;
+        startIndex = i;
       }
     }
 
-    return nearestPoint;
+    // Calcular la distancia total de la ruta original
+    double totalDistance = 0;
+    for (int i = 0; i < routePoints.length - 1; i++) {
+      totalDistance += calculateDistance(routePoints[i], routePoints[i + 1]);
+    }
+
+    // Calcular la distancia desde el punto más cercano hasta el final
+    double remainingDistance = 0;
+    for (int i = startIndex; i < routePoints.length - 1; i++) {
+      remainingDistance += calculateDistance(routePoints[i], routePoints[i + 1]);
+    }
+
+    // Calcular el tiempo proporcional basado en la distancia restante
+    return (averageMinutes * remainingDistance / totalDistance).round();
   }
 
   Future<void> _getETA() async {
-    if (_currentLocation == null || selectedRoute == null) {
+    if (_currentLocation == null || selectedRoute == null || nearestBusPoint == null) {
       setState(() => _etaResult = "Ubicación no disponible.");
       return;
     }
@@ -180,26 +254,11 @@ class _PersonCounterMapScreenState extends State<PersonCounterMapScreen> with Si
     const apiKey = 'AIzaSyDCRW7VzRxVKkwr8z6FdjgBLgT7i8KvAtg';
 
     try {
-      // Encontrar el punto más cercano de la ruta
-      LatLng nearestPoint = selectedRoute!.waypoints[0];
-      double minDistance = double.infinity;
-      
-      for (var point in selectedRoute!.waypoints) {
-        final distance = calculateDistance(
-          LatLng(_currentLocation!.latitude!, _currentLocation!.longitude!),
-          point
-        );
-        if (distance < minDistance) {
-          minDistance = distance;
-          nearestPoint = point;
-        }
-      }
-
       // Calcular tiempo caminando hasta el punto más cercano
       final walkingUri = Uri.parse(
         'https://maps.googleapis.com/maps/api/directions/json'
         '?origin=$origin'
-        '&destination=${nearestPoint.latitude},${nearestPoint.longitude}'
+        '&destination=${nearestBusPoint!.latitude},${nearestBusPoint!.longitude}'
         '&mode=walking'
         '&key=$apiKey'
       );
@@ -217,79 +276,41 @@ class _PersonCounterMapScreenState extends State<PersonCounterMapScreen> with Si
       }
 
       final walkingDuration = walkingData['routes'][0]['legs'][0]['duration']['text'];
-      final walkingPoints = PolylinePoints()
+      final newWalkingPoints = PolylinePoints()
           .decodePolyline(walkingData['routes'][0]['overview_polyline']['points'])
           .map((point) => LatLng(point.latitude, point.longitude))
           .toList();
 
       // Calcular el tiempo restante desde el punto más cercano hasta el destino
-      final remainingTimeMinutes = calculateRemainingTime(nearestPoint, selectedRoute!.waypoints, selectedRoute!.estimatedTime);
+      final remainingTimeMinutes = calculateRemainingTime(nearestBusPoint!, selectedRoute!.waypoints, selectedRoute!.estimatedTime);
+
+      // Formatear el tiempo restante
+      final String remainingTimeText;
+      if (remainingTimeMinutes >= 60) {
+        final hours = remainingTimeMinutes ~/ 60;
+        final minutes = remainingTimeMinutes % 60;
+        if (minutes > 0) {
+          remainingTimeText = "$hours h $minutes min";
+        } else {
+          remainingTimeText = "$hours h";
+        }
+      } else {
+        remainingTimeText = "$remainingTimeMinutes min";
+      }
 
       setState(() {
-        _etaResult = "Tiempo caminando hasta la ruta: $walkingDuration\n"
-            "Tiempo restante hasta destino: $remainingTimeMinutes minutos";
+        _etaResult = "🚶‍♂️ Tiempo caminando hasta la parada: $walkingDuration\n"
+            "🚌 Tiempo en transporte: $remainingTimeText";
         
-        // Combinar las rutas: ruta a pie + ruta del transporte
-        routePoints = [
-          ...walkingPoints,
-          ...selectedRoute!.waypoints,
-        ];
-
-        // Ajustar el mapa para mostrar toda la ruta
-        if (routePoints.isNotEmpty) {
-          final bounds = LatLngBounds.fromPoints([
-            ...routePoints,
-            LatLng(_currentLocation!.latitude!, _currentLocation!.longitude!),
-            selectedRoute!.end,
-          ]);
-          
-          _mapController.fitBounds(
-            bounds,
-            options: const FitBoundsOptions(
-              padding: EdgeInsets.all(50.0),
-            ),
-          );
-        }
+        // Actualizar la ruta caminando solo si se solicitó explícitamente
+        walkingPoints = newWalkingPoints;
       });
     } catch (e) {
       setState(() {
         _etaResult = "Error al calcular la ruta: $e";
-        routePoints = [];
+        walkingPoints = [];
       });
     }
-  }
-
-  // Función para calcular el tiempo restante basado en la distancia proporcional
-  int calculateRemainingTime(LatLng nearestPoint, List<LatLng> waypoints, String totalTime) {
-    // Convertir el tiempo total estimado a minutos
-    final totalMinutes = int.parse(totalTime.split(' ')[0]);
-    
-    // Encontrar el índice del punto más cercano
-    int nearestIndex = 0;
-    double minDistance = double.infinity;
-    
-    for (int i = 0; i < waypoints.length; i++) {
-      final distance = calculateDistance(nearestPoint, waypoints[i]);
-      if (distance < minDistance) {
-        minDistance = distance;
-        nearestIndex = i;
-      }
-    }
-
-    // Calcular la distancia total de la ruta
-    double totalDistance = 0;
-    for (int i = 0; i < waypoints.length - 1; i++) {
-      totalDistance += calculateDistance(waypoints[i], waypoints[i + 1]);
-    }
-
-    // Calcular la distancia restante desde el punto más cercano
-    double remainingDistance = 0;
-    for (int i = nearestIndex; i < waypoints.length - 1; i++) {
-      remainingDistance += calculateDistance(waypoints[i], waypoints[i + 1]);
-    }
-
-    // Calcular el tiempo restante proporcional
-    return (totalMinutes * remainingDistance / totalDistance).round();
   }
 
   Future<void> _openPredefinedRoutes() async {
@@ -302,27 +323,16 @@ class _PersonCounterMapScreenState extends State<PersonCounterMapScreen> with Si
       setState(() {
         selectedRoute = result;
         destination = result.end;
-        // Usar los waypoints de la ruta directamente
-        routePoints = List<LatLng>.from(result.waypoints);
+        // Mantener la ruta completa del autobús
+        busRoutePoints = List<LatLng>.from(result.waypoints);
+        // Limpiar la ruta caminando hasta que se calcule
+        walkingPoints = [];
+        nearestBusPoint = null;
       });
 
-      // Ajustar el mapa para mostrar toda la ruta
-      if (routePoints.isNotEmpty) {
-        final bounds = LatLngBounds.fromPoints([
-          ...routePoints,
-          if (_currentLocation != null)
-            LatLng(_currentLocation!.latitude!, _currentLocation!.longitude!),
-        ]);
-        
-        _mapController.fitBounds(
-          bounds,
-          options: const FitBoundsOptions(
-            padding: EdgeInsets.all(50.0),
-          ),
-        );
+      if (_currentLocation != null) {
+        await _updateRouteBasedOnLocation();
       }
-
-      _getETA();
     }
   }
 
@@ -336,481 +346,195 @@ class _PersonCounterMapScreenState extends State<PersonCounterMapScreen> with Si
     
     return Scaffold(
       body: Stack(
-        children: [
-          Column(
+        children: <Widget>[
+          FlutterMap(
+            mapController: _mapController,
+            options: MapOptions(
+              center: _currentLocation != null
+                  ? LatLng(_currentLocation!.latitude!, _currentLocation!.longitude!)
+                  : LatLng(19.264208, -99.127637),
+              zoom: 15.0,
+              onPositionChanged: (position, hasGesture) {
+                if (hasGesture) {
+                  setState(() => _showInfo = false);
+                }
+              },
+            ),
             children: [
-              Expanded(
-                child: FlutterMap(
-                  mapController: _mapController,
-                  options: MapOptions(
-                    center: _currentLocation != null
-                        ? LatLng(_currentLocation!.latitude!, _currentLocation!.longitude!)
-                        : LatLng(19.264208, -99.127637),
-                    zoom: 15.0,
-                  ),
-                  children: [
-                    TileLayer(
-                      urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                      userAgentPackageName: 'com.example.app',
-                    ),
-                    if (routePoints.isNotEmpty)
-                      PolylineLayer(
-                        polylines: [
-                          // Ruta completa (sólida)
-                          Polyline(
-                            points: routePoints,
-                            strokeWidth: 5.0,
-                            color: Theme.of(context).primaryColor.withOpacity(0.8),
-                            isDotted: false,
-                          ),
-                        ],
-                      ),
-                    MarkerLayer(
-                      markers: [
-                        if (_currentLocation != null)
-                          Marker(
-                            point: LatLng(_currentLocation!.latitude!, _currentLocation!.longitude!),
-                            child: const Icon(
-                              Icons.my_location,
-                              color: Colors.blue,
-                              size: 30,
-                            ),
-                          ),
-                        if (selectedRoute != null) ...[
-                          // Marcador de inicio de ruta
-                          Marker(
-                            point: selectedRoute!.start,
-                            child: Container(
-                              padding: const EdgeInsets.all(4),
-                              decoration: BoxDecoration(
-                                color: Colors.green,
-                                shape: BoxShape.circle,
-                                border: Border.all(color: Colors.white, width: 2),
-                              ),
-                              child: const Icon(
-                                Icons.trip_origin,
-                                color: Colors.white,
-                                size: 20,
-                              ),
-                            ),
-                          ),
-                          // Marcadores para cada parada
-                          ...selectedRoute!.stopCoordinates.map((coord) => Marker(
-                            point: coord,
-                            child: Container(
-                              padding: const EdgeInsets.all(4),
-                              decoration: BoxDecoration(
-                                color: Colors.orange,
-                                shape: BoxShape.circle,
-                                border: Border.all(color: Colors.white, width: 2),
-                              ),
-                              child: const Icon(
-                                Icons.circle,
-                                color: Colors.white,
-                                size: 12,
-                              ),
-                            ),
-                          )),
-                          // Marcador de destino
-                          Marker(
-                            point: selectedRoute!.end,
-                            child: Container(
-                              padding: const EdgeInsets.all(4),
-                              decoration: BoxDecoration(
-                                color: Colors.red,
-                                shape: BoxShape.circle,
-                                border: Border.all(color: Colors.white, width: 2),
-                              ),
-                              child: const Icon(
-                                Icons.location_on,
-                                color: Colors.white,
-                                size: 20,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ],
+              TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                userAgentPackageName: 'com.example.app',
+              ),
+              if (walkingPoints.isNotEmpty)
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: walkingPoints,
+                      strokeWidth: 4.0,
+                      color: Colors.blue.withOpacity(0.8),
+                      isDotted: true,
                     ),
                   ],
                 ),
+              if (busRoutePoints.isNotEmpty)
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: busRoutePoints,
+                      strokeWidth: 5.0,
+                      color: Theme.of(context).primaryColor.withOpacity(0.8),
+                      isDotted: false,
+                    ),
+                  ],
+                ),
+              MarkerLayer(
+                markers: [
+                  if (_currentLocation != null)
+                    Marker(
+                      point: LatLng(_currentLocation!.latitude!, _currentLocation!.longitude!),
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: Colors.blue,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white, width: 2),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.2),
+                              blurRadius: 6,
+                              offset: const Offset(0, 3),
+                            ),
+                          ],
+                        ),
+                        child: const Padding(
+                          padding: EdgeInsets.all(6.0),
+                          child: Icon(
+                            Icons.person_pin_circle,
+                            color: Colors.white,
+                            size: 24,
+                          ),
+                        ),
+                      ),
+                    ),
+                  if (selectedRoute != null) ...[
+                    // Marcador de inicio
+                    Marker(
+                      point: selectedRoute!.start,
+                      child: Container(
+                        padding: const EdgeInsets.all(4),
+                        decoration: BoxDecoration(
+                          color: Colors.green,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white, width: 2),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.2),
+                              blurRadius: 6,
+                              offset: const Offset(0, 3),
+                            ),
+                          ],
+                        ),
+                        child: const Icon(
+                          Icons.play_arrow,
+                          color: Colors.white,
+                          size: 20,
+                        ),
+                      ),
+                    ),
+                    // Marcador de fin
+                    Marker(
+                      point: selectedRoute!.end,
+                      child: Container(
+                        padding: const EdgeInsets.all(4),
+                        decoration: BoxDecoration(
+                          color: Colors.red,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white, width: 2),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.2),
+                              blurRadius: 6,
+                              offset: const Offset(0, 3),
+                            ),
+                          ],
+                        ),
+                        child: const Icon(
+                          Icons.location_on,
+                          color: Colors.white,
+                          size: 20,
+                        ),
+                      ),
+                    ),
+                  ],
+                  if (nearestBusPoint != null)
+                    Marker(
+                      point: nearestBusPoint!,
+                      child: Container(
+                        padding: const EdgeInsets.all(4),
+                        decoration: BoxDecoration(
+                          color: Colors.orange,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white, width: 2),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.2),
+                              blurRadius: 6,
+                              offset: const Offset(0, 3),
+                            ),
+                          ],
+                        ),
+                        child: const Icon(
+                          Icons.directions_bus,
+                          color: Colors.white,
+                          size: 20,
+                        ),
+                      ),
+                    ),
+                ],
               ),
             ],
           ),
           Positioned(
-            top: MediaQuery.of(context).padding.top,
+            top: 0,
             left: 0,
             right: 0,
-            child: Column(
-              children: [
-                Container(
-                  color: backgroundColor,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Expanded(
-                          child: Text(
-                            'CronusUrban',
-                            style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 24,
-                              color: textColor,
-                              letterSpacing: 1.0,
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            IconButton(
-                              padding: EdgeInsets.zero,
-                              constraints: const BoxConstraints(),
-                              icon: Icon(
-                                _showInfo ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
-                                color: textColor,
-                              ),
-                              onPressed: () {
-                                setState(() {
-                                  _showInfo = !_showInfo;
-                                });
-                              },
-                              tooltip: _showInfo ? 'Ocultar información' : 'Mostrar información',
-                            ),
-                            if (_showInfo) ...[
-                              const SizedBox(width: 8),
-                              IconButton(
-                                padding: EdgeInsets.zero,
-                                constraints: const BoxConstraints(),
-                                icon: Icon(
-                                  isDarkMode ? Icons.light_mode : Icons.dark_mode,
-                                  color: textColor,
-                                ),
-                                onPressed: () {
-                                  final platform = Theme.of(context).platform;
-                                  if (platform == TargetPlatform.android || platform == TargetPlatform.iOS) {
-                                    showDialog(
-                                      context: context,
-                                      builder: (context) => AlertDialog(
-                                        title: const Text('Cambiar tema'),
-                                        content: const Text('El tema se ajusta automáticamente según la configuración de tu dispositivo. Puedes cambiarlo en los ajustes del sistema.'),
-                                        actions: [
-                                          TextButton(
-                                            onPressed: () => Navigator.pop(context),
-                                            child: const Text('OK'),
-                                          ),
-                                        ],
-                                      ),
-                                    );
-                                  }
-                                },
-                                tooltip: 'Cambiar tema',
-                              ),
-                              const SizedBox(width: 8),
-                              IconButton(
-                                padding: EdgeInsets.zero,
-                                constraints: const BoxConstraints(),
-                                icon: Icon(Icons.gps_fixed, color: textColor),
-                                onPressed: _getLocation,
-                                tooltip: 'Mi ubicación',
-                              ),
-                            ],
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                if (_showInfo) ...[
-                  Container(
-                    color: backgroundColor,
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        ElevatedButton.icon(
-                          onPressed: _openPredefinedRoutes,
-                          icon: const Icon(Icons.route),
-                          label: const Text('Ver Rutas Disponibles'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Theme.of(context).primaryColor,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 12),
-                          ),
-                        ),
-                        const SizedBox(height: 16),
-                        if (selectedRoute != null) ...[
-                          Text(
-                            selectedRoute!.name,
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.bold,
-                              color: textColor,
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            'Tiempo estimado: ${selectedRoute!.estimatedTime}',
-                            style: TextStyle(color: textColor),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            'Próxima salida: ${selectedRoute!.schedule}',
-                            style: TextStyle(color: textColor),
-                          ),
-                          const SizedBox(height: 16),
-                        ],
-                      ],
-                    ),
-                  ),
-                ],
-              ],
+            child: Header(
+              showInfo: _showInfo,
+              onShowInfoChanged: (value) => setState(() => _showInfo = value),
+              onLocationPressed: () {
+                _getLocation();
+                if (_currentLocation != null) {
+                  _mapController.move(
+                    LatLng(_currentLocation!.latitude!, _currentLocation!.longitude!),
+                    15,
+                  );
+                }
+              },
+              selectedRoute: selectedRoute,
+              backgroundColor: backgroundColor,
+              textColor: textColor,
             ),
           ),
-          if (_currentLocation != null && _showInfo)
+          if (_showInfo)
             Positioned(
               bottom: 16,
               left: 16,
               right: 16,
-              child: Container(
-                decoration: BoxDecoration(
-                  color: backgroundColor,
-                  borderRadius: BorderRadius.circular(16),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.1),
-                      blurRadius: 10,
-                      offset: const Offset(0, 2),
-                    ),
-                  ],
-                ),
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Row(
-                      children: [
-                        Icon(
-                          Icons.info_outline,
-                          color: textColor,
-                          size: 20,
-                        ),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Información',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            color: textColor,
-                            fontSize: 16,
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    if (_currentLocation!.speed != null)
-                      Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: Theme.of(context).primaryColor.withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Column(
-                          children: [
-                            Row(
-                              children: [
-                                Icon(Icons.speed, color: Theme.of(context).primaryColor, size: 18),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: Text(
-                                    'Velocidad: ${(_currentLocation!.speed! * 3.6).toStringAsFixed(1)} km/h',
-                                    style: TextStyle(color: textColor),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ),
-                    if (selectedRoute != null) ...[
-                      const SizedBox(height: 16),
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: (isAlmostFull ? Colors.orange : Colors.green).withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Column(
-                          children: [
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(
-                                  Icons.people,
-                                  color: isAlmostFull ? Colors.orange : Colors.green,
-                                  size: 24,
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  personCount.toString(),
-                                  style: Theme.of(context).textTheme.headlineLarge?.copyWith(
-                                    color: isAlmostFull ? Colors.orange : Colors.green,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              'Personas detectadas',
-                              style: TextStyle(
-                                color: isAlmostFull ? Colors.orange : Colors.green,
-                                fontSize: 14,
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            Container(
-                              padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 12),
-                              decoration: BoxDecoration(
-                                color: (isAlmostFull ? Colors.orange : Colors.green).withOpacity(0.2),
-                                borderRadius: BorderRadius.circular(20),
-                              ),
-                              child: Text(
-                                'Lugares disponibles: $availableSpots',
-                                style: TextStyle(
-                                  color: isAlmostFull ? Colors.orange : Colors.green,
-                                  fontWeight: FontWeight.w600,
-                                  fontSize: 13,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      ElevatedButton.icon(
-                        onPressed: _getETA,
-                        icon: const Icon(Icons.directions_car),
-                        label: const Text('Calcular tiempo de llegada'),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Theme.of(context).primaryColor,
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(vertical: 12),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                        ),
-                      ),
-                      if (_etaResult.isNotEmpty)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 12),
-                          child: Container(
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: Theme.of(context).primaryColor.withOpacity(0.1),
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Column(
-                              children: [
-                                Row(
-                                  children: [
-                                    Icon(
-                                      Icons.directions_walk,
-                                      color: Theme.of(context).primaryColor,
-                                      size: 18,
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Expanded(
-                                      child: Text(
-                                        _etaResult.split('\n')[0],
-                                        style: TextStyle(
-                                          color: textColor,
-                                          fontSize: 14,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(height: 8),
-                                Row(
-                                  children: [
-                                    Icon(
-                                      Icons.directions_bus,
-                                      color: Theme.of(context).primaryColor,
-                                      size: 18,
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Expanded(
-                                      child: Text(
-                                        _etaResult.split('\n')[1],
-                                        style: TextStyle(
-                                          color: textColor,
-                                          fontSize: 14,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                    ],
-                  ],
-                ),
+              child: RouteInfo(
+                selectedRoute: selectedRoute,
+                personCount: personCount,
+                etaResult: _etaResult,
+                onOpenRoutes: _openPredefinedRoutes,
+                onUpdateETA: _getETA,
+                backgroundColor: backgroundColor,
+                textColor: textColor,
               ),
             ),
-          // Botones de zoom
-          Positioned(
-            right: 16,
-            bottom: _showInfo ? 300 : 16, // Ajusta la posición según si el panel de información está visible
-            child: Column(
-              children: [
-                Container(
-                  decoration: BoxDecoration(
-                    color: backgroundColor,
-                    borderRadius: const BorderRadius.vertical(top: Radius.circular(8)),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withOpacity(0.1),
-                        blurRadius: 4,
-                        offset: const Offset(0, 2),
-                      ),
-                    ],
-                  ),
-                  child: IconButton(
-                    icon: const Icon(Icons.add),
-                    onPressed: () {
-                      final currentZoom = _mapController.zoom;
-                      _mapController.move(_mapController.center, currentZoom + 1);
-                    },
-                    tooltip: 'Acercar',
-                  ),
-                ),
-                Container(
-                  decoration: BoxDecoration(
-                    color: backgroundColor,
-                    borderRadius: const BorderRadius.vertical(bottom: Radius.circular(8)),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withOpacity(0.1),
-                        blurRadius: 4,
-                        offset: const Offset(0, 2),
-                      ),
-                    ],
-                  ),
-                  child: IconButton(
-                    icon: const Icon(Icons.remove),
-                    onPressed: () {
-                      final currentZoom = _mapController.zoom;
-                      _mapController.move(_mapController.center, currentZoom - 1);
-                    },
-                    tooltip: 'Alejar',
-                  ),
-                ),
-              ],
-            ),
+          MapControls(
+            mapController: _mapController,
+            showInfo: _showInfo,
+            currentLocation: _currentLocation,
+            busRoutePoints: busRoutePoints,
+            walkingPoints: walkingPoints,
           ),
         ],
       ),
