@@ -1,7 +1,8 @@
 import cv2
 from ultralytics import YOLO
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template_string, request
 import threading
+import time
 
 # Inicializar Flask
 app = Flask(__name__)
@@ -9,41 +10,83 @@ app = Flask(__name__)
 # Variable global para el contador de personas
 person_count = 0
 
-# Cargar modelo YOLOv8 preentrenado
-model = YOLO('yolov8n.pt')  # Puedes usar 'yolov8s.pt' para mayor precisión
+# HTML template simple
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Contador de Personas</title>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            height: 100vh; 
+            margin: 0;
+            background-color: #f0f2f5;
+        }
+        .container {
+            text-align: center;
+            padding: 20px;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .count {
+            font-size: 48px;
+            color: #1a73e8;
+            margin: 20px 0;
+        }
+    </style>
+    <script>
+        function updateCount() {
+            fetch('/person_count')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('count').textContent = data.person_count;
+                });
+        }
+        setInterval(updateCount, 1000);
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>Contador de Personas</h1>
+        <div class="count" id="count">0</div>
+        <p>Personas detectadas</p>
+    </div>
+</body>
+</html>
+"""
 
-# Abrir la cámara (ajusta el índice si es necesario)
-cap = cv2.VideoCapture(0)
-
-def process_camera():
+def simulate_counting():
     global person_count
-    if not cap.isOpened():
-        print("No se pudo acceder a la cámara")
-        return
-
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            continue  # o break si prefieres detener el proceso
+        # Simular detección (en producción esto vendría de tu cámara real)
+        person_count = person_count + 1 if person_count < 10 else 0
+        time.sleep(2)  # Actualizar cada 2 segundos
 
-        # Realiza la detección con YOLO
-        results = model(frame)
+@app.route("/")
+def home():
+    return render_template_string(HTML_TEMPLATE)
 
-        # Filtra sólo personas (class_id = 0 para "person")
-        persons = [det for det in results[0].boxes.data if int(det[5]) == 0]
-        person_count = len(persons)
-        
-        # Opcional: controla la velocidad de procesamiento
-        # time.sleep(0.1)
+@app.route("/update_count", methods=["POST"])
+def update_count():
+    global person_count
+    data = request.get_json()
+    if data and 'count' in data:
+        person_count = data['count']
+        return jsonify({"status": "success"})
+    return jsonify({"status": "error"}), 400
 
 @app.route("/person_count", methods=["GET"])
 def get_person_count():
-    # Devuelve el contador en formato JSON
     return jsonify({"person_count": person_count})
 
 if __name__ == "__main__":
-    # Inicia el procesamiento de la cámara en un hilo separado
-    camera_thread = threading.Thread(target=process_camera, daemon=True)
-    camera_thread.start()
-    # Ejecuta el servidor Flask exponiéndolo en la red local
-    app.run(host="0.0.0.0", port=5000)
+    # Inicia la simulación en un hilo separado
+    counting_thread = threading.Thread(target=simulate_counting, daemon=True)
+    counting_thread.start()
+    # Ejecuta el servidor Flask
+    app.run(host="0.0.0.0", port=5000, debug=True)
